@@ -16,6 +16,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
+from mcp.server.transport_security import TransportSecuritySettings
 
 # ---------------------------------------------------------------------------
 # Configuration & Logging
@@ -265,6 +266,9 @@ def apply_annotation(page: fitz.Page, item: AnnotationItem) -> None:
 mcp = FastMCP(
     name="UPSC Newspaper PDF Annotator",
     stateless_http=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
 )
 
 
