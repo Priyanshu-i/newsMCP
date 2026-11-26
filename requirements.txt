@@ -1,0 +1,6 @@
+mcp[cli]>=1.6.0
+pymupdf>=1.25.0
+httpx>=0.28.0
+pydantic>=2.10.0
+starlette>=0.45.0
+uvicorn[standard]>=0.34.0
