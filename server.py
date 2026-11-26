@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
 
-import fitz  # PyMuPDF
+import pymupdf as fitz
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field, field_validator
