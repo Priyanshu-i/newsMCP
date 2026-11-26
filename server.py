@@ -8,15 +8,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
 
-import pymupdf as fitz
 import httpx
+import pymupdf as fitz
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field, field_validator
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.routing import Mount, Route
-from mcp.server.transport_security import TransportSecuritySettings
 
 # ---------------------------------------------------------------------------
 # Configuration & Logging
@@ -27,8 +27,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("upsc-pdf-annotator")
 
-FILES_DIR = Path(os.getenv("ANNOTATED_FILES_DIR", "/tmp/annotated_pdfs"))
-FILES_DIR.mkdir(parents=True, exist_ok=True)
+BASE_TMP_DIR = Path(os.getenv("ANNOTATED_FILES_DIR", "/tmp/upsc_mcp_storage"))
+UPLOADS_DIR = BASE_TMP_DIR / "uploads"
+ANNOTATED_DIR = BASE_TMP_DIR / "annotated"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+ANNOTATED_DIR.mkdir(parents=True, exist_ok=True)
 
 FILE_TTL_SECONDS = int(os.getenv("FILE_TTL_SECONDS", 24 * 60 * 60))  # 24 hours
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", 50 * 1024 * 1024))     # 50 MB
@@ -84,16 +87,17 @@ class AnnotationItem(BaseModel):
 # File Storage & Automatic 24-Hour Cleanup
 # ---------------------------------------------------------------------------
 def cleanup_expired_files() -> int:
-    """Delete annotated PDFs older than FILE_TTL_SECONDS."""
+    """Delete uploaded and annotated PDFs older than FILE_TTL_SECONDS."""
     now = time.time()
     deleted = 0
-    for file_path in FILES_DIR.glob("*.pdf"):
-        try:
-            if now - file_path.stat().st_mtime > FILE_TTL_SECONDS:
-                file_path.unlink(missing_ok=True)
-                deleted += 1
-        except OSError as exc:
-            logger.warning("Failed to remove expired file %s: %s", file_path, exc)
+    for folder in (UPLOADS_DIR, ANNOTATED_DIR):
+        for file_path in folder.glob("*.pdf"):
+            try:
+                if now - file_path.stat().st_mtime > FILE_TTL_SECONDS:
+                    file_path.unlink(missing_ok=True)
+                    deleted += 1
+            except OSError as exc:
+                logger.warning("Failed to remove expired file %s: %s", file_path, exc)
     if deleted:
         logger.info("Cleaned up %d expired PDF file(s).", deleted)
     return deleted
@@ -109,28 +113,23 @@ async def periodic_cleanup_worker() -> None:
         await asyncio.sleep(3600)
 
 
-def resolve_public_base_url(ctx: Optional[Context] = None) -> str:
-    """
-    Determine the public HTTPS base URL for clickable links.
-    Priority:
-      1. PUBLIC_BASE_URL env var (recommended for custom domains / Cloud Run)
-      2. RENDER_EXTERNAL_URL env var (automatically injected by Render)
-      3. Incoming HTTP request Host / X-Forwarded-Proto headers
-    """
+def resolve_public_base_url(ctx: Optional[Context] = None, request: Optional[Request] = None) -> str:
     explicit_url = os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL")
     if explicit_url:
         return explicit_url.rstrip("/")
 
-    if ctx is not None:
+    req = request
+    if req is None and ctx is not None:
         try:
-            request = ctx.request_context.request
-            if request is not None:
-                proto = request.headers.get("x-forwarded-proto", "https")
-                host = request.headers.get("x-forwarded-host") or request.headers.get("host")
-                if host:
-                    return f"{proto}://{host}".rstrip("/")
+            req = ctx.request_context.request
         except Exception:
-            pass
+            req = None
+
+    if req is not None:
+        proto = req.headers.get("x-forwarded-proto", "https")
+        host = req.headers.get("x-forwarded-host") or req.headers.get("host")
+        if host:
+            return f"{proto}://{host}".rstrip("/")
 
     return "http://localhost:8000"
 
@@ -143,7 +142,6 @@ async def load_pdf_bytes(pdf_url: Optional[str], pdf_base64: Optional[str]) -> b
         raise ValueError("Provide exactly one of 'pdf_url' or 'pdf_base64'.")
 
     if pdf_base64:
-        # Strip optional data URI prefix if passed (e.g., "data:application/pdf;base64,...")
         raw_b64 = pdf_base64.split(",", 1)[1] if "," in pdf_base64 else pdf_base64
         try:
             data = base64.b64decode(raw_b64, validate=True)
@@ -154,6 +152,15 @@ async def load_pdf_bytes(pdf_url: Optional[str], pdf_base64: Optional[str]) -> b
         return data
 
     assert pdf_url is not None
+
+    # Fast-path: if pdf_url points to this server's /uploads/<filename>.pdf, read directly from disk
+    if "/uploads/" in pdf_url:
+        candidate_name = pdf_url.rsplit("/uploads/", 1)[-1].split("?", 1)[0]
+        if "/" not in candidate_name and "\\" not in candidate_name and candidate_name.endswith(".pdf"):
+            local_path = (UPLOADS_DIR / candidate_name).resolve()
+            if local_path.parent == UPLOADS_DIR.resolve() and local_path.is_file():
+                return local_path.read_bytes()
+
     async with httpx.AsyncClient(follow_redirects=True, timeout=45.0) as client:
         resp = await client.get(pdf_url)
         resp.raise_for_status()
@@ -163,7 +170,6 @@ async def load_pdf_bytes(pdf_url: Optional[str], pdf_base64: Optional[str]) -> b
 
 
 def normalized_to_pdf_rect(coords: list[float], page: fitz.Page) -> fitz.Rect:
-    """Convert [ymin, xmin, ymax, xmax] (0..1000) to exact PyMuPDF page coordinates."""
     ymin, xmin, ymax, xmax = coords
     pw = page.rect.width
     ph = page.rect.height
@@ -176,11 +182,9 @@ def normalized_to_pdf_rect(coords: list[float], page: fitz.Page) -> fitz.Rect:
 
 
 def apply_annotation(page: fitz.Page, item: AnnotationItem) -> None:
-    """Render a single UPSC visual annotation onto a PDF page."""
     rect = normalized_to_pdf_rect(item.coordinates, page)
 
     if item.action == "box":
-        # Crisp emerald-green border around must-read UPSC article
         green = (0.06, 0.52, 0.22)
         page.draw_rect(rect, color=green, width=1.8, overlay=True)
 
@@ -194,7 +198,6 @@ def apply_annotation(page: fitz.Page, item: AnnotationItem) -> None:
         badge_h = 13.0
         badge_w = text_width + (pad_x * 2)
 
-        # Position badge cleanly at top-left corner (inside top edge if near page top)
         badge_y0 = rect.y0 - badge_h if rect.y0 >= badge_h + 2 else rect.y0
         badge_rect = fitz.Rect(
             rect.x0,
@@ -213,21 +216,22 @@ def apply_annotation(page: fitz.Page, item: AnnotationItem) -> None:
         )
 
     elif item.action == "highlight":
-        # True transparent yellow PDF highlight annotation
         annot = page.add_highlight_annot(rect)
         annot.set_colors(stroke=(1.0, 0.92, 0.15))
         annot.set_opacity(0.45)
         annot.update()
 
     elif item.action == "underline":
-        # Clean blue underline along the bottom edge of the target bounding box
         blue = (0.08, 0.36, 0.84)
-        p1 = fitz.Point(rect.x0, rect.y1)
-        p2 = fitz.Point(rect.x1, rect.y1)
-        page.draw_line(p1, p2, color=blue, width=1.6, overlay=True)
+        page.draw_line(
+            fitz.Point(rect.x0, rect.y1),
+            fitz.Point(rect.x1, rect.y1),
+            color=blue,
+            width=1.6,
+            overlay=True,
+        )
 
     elif item.action == "cross":
-        # Large red diagonal "X" across irrelevant sections to skip
         red = (0.85, 0.12, 0.12)
         page.draw_rect(rect, color=red, width=0.8, stroke_opacity=0.45, overlay=True)
         page.draw_line(
@@ -246,7 +250,6 @@ def apply_annotation(page: fitz.Page, item: AnnotationItem) -> None:
         )
 
     elif item.action == "note":
-        # Interactive PDF sticky-note annotation at top-left of target region
         content = (item.note_text or item.label or "Important UPSC reference.").strip()
         if item.label and item.note_text:
             content = f"{item.label}\n\n{item.note_text}"
@@ -318,12 +321,12 @@ async def annotate_pdf_pages(
             applied_count += 1
 
         file_id = f"{uuid.uuid4().hex}.pdf"
-        output_path = FILES_DIR / file_id
+        output_path = ANNOTATED_DIR / file_id
         doc.save(str(output_path), garbage=3, deflate=True)
     finally:
         doc.close()
 
-    base_url = resolve_public_base_url(ctx)
+    base_url = resolve_public_base_url(ctx=ctx)
     download_url = f"{base_url}/files/{file_id}"
 
     return {
@@ -337,23 +340,131 @@ async def annotate_pdf_pages(
 
 
 # ---------------------------------------------------------------------------
-# HTTP Routes (/files/<unique_id>.pdf, /health, and /mcp)
+# Web Upload UI & HTTP File Serving Routes
 # ---------------------------------------------------------------------------
-async def serve_annotated_pdf(request: Request) -> FileResponse | JSONResponse:
-    filename = request.path_params["filename"]
+UPLOAD_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UPSC Newspaper PDF Uploader — MCP Bridge</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 16px; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 28px; max-width: 540px; width: 100%; box-shadow: 0 20px 40px rgba(0,0,0,0.4); }
+    h1 { font-size: 1.35rem; margin: 0 0 8px; }
+    p { color: #94a3b8; font-size: 0.92rem; line-height: 1.5; margin: 0 0 20px; }
+    .dropzone { border: 2px dashed #475569; border-radius: 10px; padding: 32px 16px; text-align: center; cursor: pointer; transition: 0.2s; background: #0f172a; }
+    .dropzone:hover, .dropzone.drag { border-color: #22c55e; background: #052e16; }
+    input[type=file] { display: none; }
+    .result { display: none; margin-top: 20px; background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; }
+    textarea { width: 100%; height: 115px; background: #1e293b; color: #e2e8f0; border: 1px solid #475569; border-radius: 8px; padding: 10px; font-family: monospace; font-size: 0.82rem; box-sizing: border-box; resize: none; }
+    button { margin-top: 10px; width: 100%; background: #16a34a; color: white; border: none; padding: 11px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 0.95rem; }
+    button:hover { background: #15803d; }
+    .status { margin-top: 12px; font-size: 0.88rem; color: #38bdf8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>UPSC Newspaper PDF Annotator</h1>
+    <p>1. Attach your newspaper PDF in Gemini chat.<br>2. Drop the same PDF below to generate a temporary link (auto-deletes in 24h) and paste the copied prompt into Gemini.</p>
+    <div class="dropzone" id="dz" onclick="document.getElementById('fileInput').click()">
+      <strong>Click or drag &amp; drop PDF here</strong><br><span style="font-size:0.82rem;color:#64748b;">Max 50 MB</span>
+      <input type="file" id="fileInput" accept="application/pdf" />
+    </div>
+    <div class="status" id="status"></div>
+    <div class="result" id="result">
+      <div style="font-size:0.82rem;color:#4ade80;margin-bottom:8px;">Ready! Paste this into your Gemini chat:</div>
+      <textarea id="promptBox" readonly></textarea>
+      <button onclick="copyPrompt()">Copy Prompt for Gemini</button>
+    </div>
+  </div>
+  <script>
+    const dz = document.getElementById('dz');
+    const fi = document.getElementById('fileInput');
+    const status = document.getElementById('status');
+    const result = document.getElementById('result');
+    const promptBox = document.getElementById('promptBox');
 
-    # Prevent path traversal; only allow flat <uuid>.pdf filenames
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
+    dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+    dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag'); if (e.dataTransfer.files[0]) uploadFile(e.dataTransfer.files[0]); });
+    fi.addEventListener('change', () => { if (fi.files[0]) uploadFile(fi.files[0]); });
+
+    async function uploadFile(file) {
+      status.textContent = 'Uploading ' + file.name + '...';
+      result.style.display = 'none';
+      const fd = new FormData();
+      fd.append('file', file);
+      try {
+        const res = await fetch('/upload', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Upload failed');
+        status.textContent = 'Uploaded (' + data.pages + ' pages).';
+        promptBox.value = `Annotate the attached newspaper PDF for UPSC CSE Prelims & Mains using annotate_pdf_pages with pdf_url="${data.pdf_url}". Add green box tags ([Prelims], [GS2 - Polity], [GS3 - Economy], [Editorial]) on must-read articles, yellow highlights on key facts/schemes/committees, blue underlines on key terms, red crosses on irrelevant politics/crime/sports, and sticky notes explaining UPSC relevance.`;
+        result.style.display = 'block';
+      } catch (err) {
+        status.textContent = 'Error: ' + err.message;
+      }
+    }
+
+    function copyPrompt() {
+      promptBox.select();
+      navigator.clipboard.writeText(promptBox.value);
+      status.textContent = 'Copied to clipboard! Paste it into Gemini.';
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+async def home_page(request: Request) -> HTMLResponse:
+    return HTMLResponse(UPLOAD_PAGE_HTML)
+
+
+async def upload_pdf(request: Request) -> JSONResponse:
+    cleanup_expired_files()
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "read"):
+        return JSONResponse({"error": "No PDF file provided under form field 'file'."}, status_code=400)
+
+    data = await upload.read()
+    if not data:
+        return JSONResponse({"error": "Uploaded file is empty."}, status_code=400)
+    if len(data) > MAX_PDF_BYTES:
+        return JSONResponse({"error": f"File exceeds {MAX_PDF_BYTES // (1024 * 1024)} MB limit."}, status_code=413)
+
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+        page_count = len(doc)
+        doc.close()
+    except Exception:
+        return JSONResponse({"error": "Invalid PDF file."}, status_code=400)
+
+    file_id = f"{uuid.uuid4().hex}.pdf"
+    (UPLOADS_DIR / file_id).write_bytes(data)
+
+    base_url = resolve_public_base_url(request=request)
+    return JSONResponse({
+        "status": "ok",
+        "pdf_url": f"{base_url}/uploads/{file_id}",
+        "pages": page_count,
+        "expires_in_hours": round(FILE_TTL_SECONDS / 3600, 1),
+    })
+
+
+def _serve_pdf_from_dir(directory: Path, filename: str) -> FileResponse | JSONResponse:
     if "/" in filename or "\\" in filename or not filename.endswith(".pdf"):
         return JSONResponse({"error": "Invalid file name."}, status_code=400)
 
-    file_path = (FILES_DIR / filename).resolve()
-    if file_path.parent != FILES_DIR.resolve() or not file_path.is_file():
-        return JSONResponse({"error": "Annotated PDF not found or expired."}, status_code=404)
+    file_path = (directory / filename).resolve()
+    if file_path.parent != directory.resolve() or not file_path.is_file():
+        return JSONResponse({"error": "PDF not found or expired."}, status_code=404)
 
-    # Check 24-hour expiration on access
     if time.time() - file_path.stat().st_mtime > FILE_TTL_SECONDS:
         file_path.unlink(missing_ok=True)
-        return JSONResponse({"error": "Annotated PDF has expired (24h limit)."}, status_code=410)
+        return JSONResponse({"error": "PDF has expired (24h limit)."}, status_code=410)
 
     return FileResponse(
         path=str(file_path),
@@ -365,11 +476,18 @@ async def serve_annotated_pdf(request: Request) -> FileResponse | JSONResponse:
     )
 
 
+async def serve_uploaded_pdf(request: Request) -> FileResponse | JSONResponse:
+    return _serve_pdf_from_dir(UPLOADS_DIR, request.path_params["filename"])
+
+
+async def serve_annotated_pdf(request: Request) -> FileResponse | JSONResponse:
+    return _serve_pdf_from_dir(ANNOTATED_DIR, request.path_params["filename"])
+
+
 async def health_check(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "service": "upsc-pdf-annotator"})
 
 
-# Build FastMCP's Streamable HTTP ASGI app (exposes /mcp)
 mcp_http_app = mcp.streamable_http_app()
 
 
@@ -389,7 +507,10 @@ async def lifespan(app: Starlette):
 
 app = Starlette(
     routes=[
+        Route("/", home_page, methods=["GET"]),
+        Route("/upload", upload_pdf, methods=["POST"]),
         Route("/health", health_check, methods=["GET"]),
+        Route("/uploads/{filename:str}", serve_uploaded_pdf, methods=["GET"]),
         Route("/files/{filename:str}", serve_annotated_pdf, methods=["GET"]),
         Mount("/", app=mcp_http_app),
     ],
