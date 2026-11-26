@@ -63,6 +63,14 @@ class AnnotationItem(BaseModel):
         max_length=4,
         description="Normalized bounding box [ymin, xmin, ymax, xmax] on a 0 to 1000 scale.",
     )
+    target_text: Optional[str] = Field(
+        default=None,
+        description=(
+            "Exact snippet of text from the PDF to snap onto. Strongly recommended for "
+            "'highlight' and 'underline' (exact phrase/number/term) and helpful for 'box' "
+            "(article headline) so PyMuPDF aligns to exact text coordinates."
+        ),
+    )
     label: Optional[str] = Field(
         default=None,
         description="Short UPSC tag for 'box' (e.g., '[GS2 - Polity]', '[Prelims]', '[Editorial]').",
@@ -135,7 +143,7 @@ def resolve_public_base_url(ctx: Optional[Context] = None, request: Optional[Req
 
 
 # ---------------------------------------------------------------------------
-# PDF Loading & Visual Rendering Engine (PyMuPDF)
+# PDF Loading & Geometry Snapping Engine (PyMuPDF)
 # ---------------------------------------------------------------------------
 async def load_pdf_bytes(pdf_url: Optional[str], pdf_base64: Optional[str]) -> bytes:
     if bool(pdf_url) == bool(pdf_base64):
@@ -153,7 +161,6 @@ async def load_pdf_bytes(pdf_url: Optional[str], pdf_base64: Optional[str]) -> b
 
     assert pdf_url is not None
 
-    # Fast-path: if pdf_url points to this server's /uploads/<filename>.pdf, read directly from disk
     if "/uploads/" in pdf_url:
         candidate_name = pdf_url.rsplit("/uploads/", 1)[-1].split("?", 1)[0]
         if "/" not in candidate_name and "\\" not in candidate_name and candidate_name.endswith(".pdf"):
@@ -181,10 +188,145 @@ def normalized_to_pdf_rect(coords: list[float], page: fitz.Page) -> fitz.Rect:
     )
 
 
+def pdf_rect_to_normalized(rect: fitz.Rect, page: fitz.Page) -> list[int]:
+    pw = page.rect.width or 1.0
+    ph = page.rect.height or 1.0
+    return [
+        max(0, min(1000, round((rect.y0 / ph) * 1000))),
+        max(0, min(1000, round((rect.x0 / pw) * 1000))),
+        max(0, min(1000, round((rect.y1 / ph) * 1000))),
+        max(0, min(1000, round((rect.x1 / pw) * 1000))),
+    ]
+
+
+def clamp_rect_to_page(rect: fitz.Rect, page: fitz.Page, margin: float = 6.0) -> fitz.Rect:
+    """Keep bounding boxes strictly inside visible page boundaries."""
+    x0 = max(margin, min(rect.x0, page.rect.width - margin - 10.0))
+    y0 = max(margin, min(rect.y0, page.rect.height - margin - 10.0))
+    x1 = max(x0 + 10.0, min(rect.x1, page.rect.width - margin))
+    y1 = max(y0 + 10.0, min(rect.y1, page.rect.height - margin))
+    return fitz.Rect(x0, y0, x1, y1)
+
+
+def find_best_text_quads(
+    page: fitz.Page,
+    target_text: str,
+    approx_rect: fitz.Rect,
+) -> list[fitz.Quad]:
+    """
+    Search exact text on the PDF page and pick the occurrence closest to approx_rect.
+    """
+    cleaned = " ".join(target_text.split()).strip()
+    if not cleaned:
+        return []
+
+    quads = page.search_for(cleaned, quads=True)
+    if not quads and len(cleaned) > 35:
+        # Fallback to first 35 chars if multi-line hyphenation broke exact match
+        quads = page.search_for(cleaned[:35].rsplit(" ", 1)[0], quads=True)
+
+    if not quads:
+        return []
+
+    # Filter quads whose center falls inside or very close to approx_rect
+    expanded = fitz.Rect(
+        approx_rect.x0 - 45,
+        approx_rect.y0 - 45,
+        approx_rect.x1 + 45,
+        approx_rect.y1 + 45,
+    )
+    nearby = [q for q in quads if expanded.contains((q.rect.tl + q.rect.br) * 0.5)]
+    return nearby if nearby else quads
+
+
+def snap_section_rect(
+    page: fitz.Page,
+    approx_rect: fitz.Rect,
+    headline_text: Optional[str] = None,
+) -> fitz.Rect:
+    """
+    Snap a rough article/section box onto actual PDF text blocks so boxes align
+    with newspaper columns and don't cut halfway through paragraphs or spill off-page.
+    """
+    blocks = page.get_text("blocks")  # (x0, y0, x1, y1, text, block_no, block_type)
+    text_blocks = [
+        fitz.Rect(b[0], b[1], b[2], b[3])
+        for b in blocks
+        if b[6] == 0 and b[4].strip()
+    ]
+
+    if not text_blocks:
+        return clamp_rect_to_page(approx_rect, page)
+
+    # If headline_text is given, anchor top edge to the matched headline block
+    top_anchor = approx_rect.y0
+    if headline_text:
+        h_quads = find_best_text_quads(page, headline_text, approx_rect)
+        if h_quads:
+            top_anchor = min(q.rect.y0 for q in h_quads)
+
+    search_box = fitz.Rect(
+        approx_rect.x0,
+        min(approx_rect.y0, top_anchor),
+        approx_rect.x1,
+        approx_rect.y1,
+    )
+
+    # Keep text blocks whose horizontal & vertical centers fall inside search_box
+    matched: list[fitz.Rect] = []
+    for b_rect in text_blocks:
+        cx = (b_rect.x0 + b_rect.x1) * 0.5
+        cy = (b_rect.y0 + b_rect.y1) * 0.5
+        if search_box.x0 <= cx <= search_box.x1 and search_box.y0 <= cy <= search_box.y1:
+            matched.append(b_rect)
+
+    if not matched:
+        return clamp_rect_to_page(approx_rect, page)
+
+    union = fitz.Rect(matched[0])
+    for r in matched[1:]:
+        union.include_rect(r)
+
+    pad = 4.0
+    snapped = fitz.Rect(union.x0 - pad, union.y0 - pad, union.x1 + pad, union.y1 + pad)
+    return clamp_rect_to_page(snapped, page)
+
+
+def snap_line_words(page: fitz.Page, approx_rect: fitz.Rect) -> list[fitz.Rect]:
+    """
+    When target_text isn't provided for highlight/underline, snap to actual words
+    overlapping approx_rect and group them into clean per-line rectangles.
+    """
+    words = page.get_text("words")  # (x0, y0, x1, y1, word, block_no, line_no, word_no)
+    selected = []
+    for w in words:
+        w_rect = fitz.Rect(w[0], w[1], w[2], w[3])
+        cy = (w_rect.y0 + w_rect.y1) * 0.5
+        cx = (w_rect.x0 + w_rect.x1) * 0.5
+        if approx_rect.x0 <= cx <= approx_rect.x1 and approx_rect.y0 <= cy <= approx_rect.y1:
+            selected.append((w[5], w[6], w_rect))
+
+    if not selected:
+        return []
+
+    lines: dict[tuple[int, int], fitz.Rect] = {}
+    for block_no, line_no, w_rect in selected:
+        key = (block_no, line_no)
+        if key not in lines:
+            lines[key] = fitz.Rect(w_rect)
+        else:
+            lines[key].include_rect(w_rect)
+    return list(lines.values())
+
+
+# ---------------------------------------------------------------------------
+# Visual Rendering Engine
+# ---------------------------------------------------------------------------
 def apply_annotation(page: fitz.Page, item: AnnotationItem) -> None:
-    rect = normalized_to_pdf_rect(item.coordinates, page)
+    raw_rect = clamp_rect_to_page(normalized_to_pdf_rect(item.coordinates, page), page)
 
     if item.action == "box":
+        rect = snap_section_rect(page, raw_rect, headline_text=item.target_text)
         green = (0.06, 0.52, 0.22)
         page.draw_rect(rect, color=green, width=1.8, overlay=True)
 
@@ -192,22 +334,17 @@ def apply_annotation(page: fitz.Page, item: AnnotationItem) -> None:
         if not tag_text.startswith("["):
             tag_text = f"[{tag_text}]"
 
-        font_size = 8.5
+        font_size = 8.0
         text_width = fitz.get_text_length(tag_text, fontname="hebo", fontsize=font_size)
         pad_x = 4.0
-        badge_h = 13.0
-        badge_w = text_width + (pad_x * 2)
+        badge_h = 12.5
+        badge_w = min(text_width + (pad_x * 2), page.rect.width - rect.x0 - 4.0)
 
-        badge_y0 = rect.y0 - badge_h if rect.y0 >= badge_h + 2 else rect.y0
-        badge_rect = fitz.Rect(
-            rect.x0,
-            badge_y0,
-            min(rect.x0 + badge_w, page.rect.width),
-            badge_y0 + badge_h,
-        )
+        badge_y0 = rect.y0 - badge_h if rect.y0 >= badge_h + 4.0 else rect.y0
+        badge_rect = fitz.Rect(rect.x0, badge_y0, rect.x0 + badge_w, badge_y0 + badge_h)
         page.draw_rect(badge_rect, color=green, fill=green, overlay=True)
         page.insert_text(
-            fitz.Point(badge_rect.x0 + pad_x, badge_rect.y1 - 3.2),
+            fitz.Point(badge_rect.x0 + pad_x, badge_rect.y1 - 3.0),
             tag_text,
             fontname="hebo",
             fontsize=font_size,
@@ -216,22 +353,56 @@ def apply_annotation(page: fitz.Page, item: AnnotationItem) -> None:
         )
 
     elif item.action == "highlight":
-        annot = page.add_highlight_annot(rect)
-        annot.set_colors(stroke=(1.0, 0.92, 0.15))
-        annot.set_opacity(0.45)
-        annot.update()
+        yellow = (1.0, 0.92, 0.15)
+        quads = find_best_text_quads(page, item.target_text, raw_rect) if item.target_text else []
+        if quads:
+            annot = page.add_highlight_annot(quads)
+            annot.set_colors(stroke=yellow)
+            annot.set_opacity(0.45)
+            annot.update()
+        else:
+            line_rects = snap_line_words(page, raw_rect) or [raw_rect]
+            for lr in line_rects:
+                annot = page.add_highlight_annot(lr)
+                annot.set_colors(stroke=yellow)
+                annot.set_opacity(0.45)
+                annot.update()
 
     elif item.action == "underline":
         blue = (0.08, 0.36, 0.84)
-        page.draw_line(
-            fitz.Point(rect.x0, rect.y1),
-            fitz.Point(rect.x1, rect.y1),
-            color=blue,
-            width=1.6,
-            overlay=True,
-        )
+        quads = find_best_text_quads(page, item.target_text, raw_rect) if item.target_text else []
+        if quads:
+            for q in quads:
+                r = q.rect
+                page.draw_line(
+                    fitz.Point(r.x0, r.y1 + 0.8),
+                    fitz.Point(r.x1, r.y1 + 0.8),
+                    color=blue,
+                    width=1.4,
+                    overlay=True,
+                )
+        else:
+            line_rects = snap_line_words(page, raw_rect)
+            if line_rects:
+                for lr in line_rects:
+                    page.draw_line(
+                        fitz.Point(lr.x0, lr.y1 + 0.8),
+                        fitz.Point(lr.x1, lr.y1 + 0.8),
+                        color=blue,
+                        width=1.4,
+                        overlay=True,
+                    )
+            else:
+                page.draw_line(
+                    fitz.Point(raw_rect.x0, raw_rect.y1),
+                    fitz.Point(raw_rect.x1, raw_rect.y1),
+                    color=blue,
+                    width=1.4,
+                    overlay=True,
+                )
 
     elif item.action == "cross":
+        rect = snap_section_rect(page, raw_rect, headline_text=item.target_text)
         red = (0.85, 0.12, 0.12)
         page.draw_rect(rect, color=red, width=0.8, stroke_opacity=0.45, overlay=True)
         page.draw_line(
@@ -250,13 +421,14 @@ def apply_annotation(page: fitz.Page, item: AnnotationItem) -> None:
         )
 
     elif item.action == "note":
+        rect = snap_section_rect(page, raw_rect, headline_text=item.target_text)
         content = (item.note_text or item.label or "Important UPSC reference.").strip()
         if item.label and item.note_text:
             content = f"{item.label}\n\n{item.note_text}"
 
         note_point = fitz.Point(
-            min(max(rect.x0, 4.0), page.rect.width - 20.0),
-            min(max(rect.y0, 4.0), page.rect.height - 20.0),
+            min(max(rect.x0 + 2.0, 6.0), page.rect.width - 24.0),
+            min(max(rect.y0 + 2.0, 6.0), page.rect.height - 24.0),
         )
         annot = page.add_text_annot(note_point, content, icon="Note")
         annot.set_colors(stroke=(0.96, 0.68, 0.05))
@@ -276,6 +448,44 @@ mcp = FastMCP(
 
 
 @mcp.tool()
+async def get_pdf_layout(
+    pdf_url: Optional[str] = None,
+    pdf_base64: Optional[str] = None,
+    pages: Optional[list[int]] = None,
+) -> dict:
+    """
+    Extract exact normalized [ymin, xmin, ymax, xmax] (0-1000) bounding boxes of
+    text blocks and headlines per page so annotations align cleanly with newspaper columns.
+    """
+    pdf_bytes = await load_pdf_bytes(pdf_url=pdf_url, pdf_base64=pdf_base64)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        total_pages = len(doc)
+        target_pages = pages if pages else list(range(1, total_pages + 1))
+        layout = []
+        for pno in target_pages:
+            if pno < 1 or pno > total_pages:
+                continue
+            page = doc[pno - 1]
+            blocks_out = []
+            for b in page.get_text("blocks"):
+                if b[6] != 0:
+                    continue
+                txt = " ".join(b[4].split()).strip()
+                if not txt:
+                    continue
+                coords = pdf_rect_to_normalized(fitz.Rect(b[0], b[1], b[2], b[3]), page)
+                blocks_out.append({
+                    "coordinates": coords,
+                    "text_preview": txt[:140],
+                })
+            layout.append({"page_number": pno, "blocks": blocks_out})
+        return {"total_pages": total_pages, "pages": layout}
+    finally:
+        doc.close()
+
+
+@mcp.tool()
 async def annotate_pdf_pages(
     annotations: list[AnnotationItem],
     pdf_url: Optional[str] = None,
@@ -286,11 +496,9 @@ async def annotate_pdf_pages(
     Visually annotate a newspaper or study PDF for UPSC preparation and return
     an instant clickable HTTPS link to open the annotated PDF in Chrome.
 
-    Args:
-        annotations: List of page-by-page visual instructions with normalized
-            [ymin, xmin, ymax, xmax] coordinates on a 0-1000 scale.
-        pdf_url: Direct HTTP/HTTPS URL to the source PDF (provide either pdf_url or pdf_base64).
-        pdf_base64: Base64-encoded PDF bytes (provide either pdf_url or pdf_base64).
+    Tip for razor-sharp alignment:
+    - Always provide 'target_text' (exact phrase/number for highlight/underline,
+      or exact headline for box/cross) alongside 'coordinates' [ymin, xmin, ymax, xmax].
     """
     cleanup_expired_files()
 
@@ -350,14 +558,14 @@ UPLOAD_PAGE_HTML = """<!DOCTYPE html>
   <title>UPSC Newspaper PDF Uploader — MCP Bridge</title>
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 16px; }
-    .card { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 28px; max-width: 540px; width: 100%; box-shadow: 0 20px 40px rgba(0,0,0,0.4); }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 28px; max-width: 560px; width: 100%; box-shadow: 0 20px 40px rgba(0,0,0,0.4); }
     h1 { font-size: 1.35rem; margin: 0 0 8px; }
     p { color: #94a3b8; font-size: 0.92rem; line-height: 1.5; margin: 0 0 20px; }
     .dropzone { border: 2px dashed #475569; border-radius: 10px; padding: 32px 16px; text-align: center; cursor: pointer; transition: 0.2s; background: #0f172a; }
     .dropzone:hover, .dropzone.drag { border-color: #22c55e; background: #052e16; }
     input[type=file] { display: none; }
     .result { display: none; margin-top: 20px; background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 16px; }
-    textarea { width: 100%; height: 115px; background: #1e293b; color: #e2e8f0; border: 1px solid #475569; border-radius: 8px; padding: 10px; font-family: monospace; font-size: 0.82rem; box-sizing: border-box; resize: none; }
+    textarea { width: 100%; height: 140px; background: #1e293b; color: #e2e8f0; border: 1px solid #475569; border-radius: 8px; padding: 10px; font-family: monospace; font-size: 0.82rem; box-sizing: border-box; resize: none; }
     button { margin-top: 10px; width: 100%; background: #16a34a; color: white; border: none; padding: 11px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 0.95rem; }
     button:hover { background: #15803d; }
     .status { margin-top: 12px; font-size: 0.88rem; color: #38bdf8; }
@@ -400,7 +608,7 @@ UPLOAD_PAGE_HTML = """<!DOCTYPE html>
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Upload failed');
         status.textContent = 'Uploaded (' + data.pages + ' pages).';
-        promptBox.value = `Annotate the attached newspaper PDF for UPSC CSE Prelims & Mains using annotate_pdf_pages with pdf_url="${data.pdf_url}". Add green box tags ([Prelims], [GS2 - Polity], [GS3 - Economy], [Editorial]) on must-read articles, yellow highlights on key facts/schemes/committees, blue underlines on key terms, red crosses on irrelevant politics/crime/sports, and sticky notes explaining UPSC relevance.`;
+        promptBox.value = `Annotate the attached newspaper PDF for UPSC CSE Prelims & Mains using pdf_url="${data.pdf_url}". First call get_pdf_layout to read exact column/block coordinates, then call annotate_pdf_pages (always passing exact target_text for every highlight, underline, and article headline) to add green box tags ([Prelims], [GS2 - Polity], [GS3 - Economy], [Editorial]) on must-read articles, yellow highlights on key facts/schemes/committees, blue underlines on key terms, red crosses on ads/politics/crime/sports, and sticky notes explaining UPSC relevance.`;
         result.style.display = 'block';
       } catch (err) {
         status.textContent = 'Error: ' + err.message;
